@@ -11,6 +11,8 @@ import (
 	"io"
 	"math"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/fastly/compute-sdk-go/internal/abi/prim"
@@ -286,6 +288,21 @@ const (
 	invalidBodyHandle = bodyHandle(math.MaxUint32 - 1)
 )
 
+// HTTPBody represents the body of an HTTP request or response.
+// The zero value is invalid.
+type HTTPBody struct {
+	h bodyHandle
+
+	// Closing an HTTP body is only possible if the encapsulated body handle has
+	// its "streaming bit" set. The streaming bit is set when the handle is
+	// successfully passed to send_async_streaming or send_downstream with
+	// streaming set to 1. The streaming bit is unqueryable, and we need to be
+	// able to abstract over different concrete bodies. So we try to mirror that
+	// hidden state in the body handle with this visible state in the struct,
+	// and use it to check if it's safe to close the handle.
+	closable bool
+}
+
 // witx:
 //
 //	(typename $request_handle (handle))
@@ -294,6 +311,12 @@ type requestHandle handle
 const (
 	invalidRequestHandle = requestHandle(math.MaxUint32 - 1)
 )
+
+// HTTPRequest represents an HTTP request.
+// The zero value is invalid.
+type HTTPRequest struct {
+	h requestHandle
+}
 
 // witx:
 //
@@ -304,6 +327,12 @@ const (
 	invalidResponseHandle = responseHandle(math.MaxUint32 - 1)
 )
 
+// HTTPResponse represents a response to an HTTP request.
+// The zero value is invalid.
+type HTTPResponse struct {
+	h responseHandle
+}
+
 // witx:
 //
 //	(typename $request_promise_handle (handle))
@@ -312,6 +341,10 @@ type requestPromiseHandle handle
 const (
 	invalidRequestPromiseHandle = requestPromiseHandle(math.MaxUint32 - 1)
 )
+
+type HTTPRequestPromise struct {
+	h requestPromiseHandle
+}
 
 // witx:
 //
@@ -322,20 +355,67 @@ const (
 	invalidPendingRequestHandle = pendingRequestHandle(math.MaxUint32 - 1)
 )
 
+// PendingRequest is an outstanding or completed asynchronous HTTP request.
+// The zero value is invalid.
+type PendingRequest struct {
+	h pendingRequestHandle
+}
+
 // witx:
 //
 //	(typename $endpoint_handle (handle))
 type endpointHandle handle
+
+// LogEndpoint represents a specific Fastly log endpoint.
+type LogEndpoint struct {
+	h endpointHandle
+}
 
 // witx:
 //
 //	(typename $dictionary_handle (handle))
 type dictionaryHandle handle
 
+// Dictionary represents a Fastly edge dictionary, a collection of read-only
+// key/value pairs. For convenience, keys are modeled as Go strings, and values
+// as byte slices.
+//
+// NOTE: wasm, by definition, is a single-threaded execution environment. This
+// allows us to use valueBuf scratch space between the guest and host to avoid
+// allocations any larger than necessary, without locking.
+type Dictionary struct {
+	h dictionaryHandle
+
+	mu       sync.Mutex // protects valueBuf
+	valueBuf [dictionaryMaxValueLen]byte
+}
+
+// Dictionaries are subject to very specific limitations: 255 character keys and 8000 character values, utf-8 encoded.
+// The current storage collation limits utf-8 representations to 3 bytes in length.
+// https://docs.fastly.com/en/guides/about-edge-dictionaries#limitations-and-considerations
+// https://dev.mysql.com/doc/refman/8.4/en/charset-unicode-utf8mb3.html
+// https://en.wikipedia.org/wiki/UTF-8#Encoding
+const (
+	dictionaryMaxKeyLen   = 255 * 3  // known maximum size for dictionary keys: 765 bytes, for 255 3-byte utf-8 encoded characters
+	dictionaryMaxValueLen = 8000 * 3 // known maximum size for dictionary store values: 24,000 bytes, for 8000 3-byte utf-8 encoded characters
+)
+
 // witx:
 //
 //	(typename $config_store_handle (handle))
 type configstoreHandle handle
+
+// ConfigStore represents a Fastly config store a collection of read-only
+// key/value pairs. For convenience, keys are modeled as Go strings, and values
+// as byte slices.
+type ConfigStore struct {
+	h configstoreHandle
+}
+
+// Config Stores are limited to keys of length 255 character. By default, values are limited to 8000 character values,
+// but this can be adjusted on a per-customer basis.
+// https://docs.fastly.com/en/guides/about-edge-dictionaries#limitations-and-considerations
+const configstoreMaxKeyLen = 255 * 3 // known maximum size for config store keys: 765 bytes, for 255 3-byte utf-8 encoded characters
 
 // witx:
 //
@@ -359,7 +439,8 @@ func (r multiValueCursorResult) toCursor() multiValueCursor { return multiValueC
 //		  $pass
 //		  $ttl
 //		  $stale_while_revalidate
-//		  $pci))
+//		  $pci
+//		  $lookup_timeout))
 type cacheOverrideTag uint32
 
 const (
@@ -368,6 +449,7 @@ const (
 	cacheOverrideTagTTL                  cacheOverrideTag = 0b0000_0010 // $ttl
 	cacheOverrideTagStaleWhileRevalidate cacheOverrideTag = 0b0000_0100 // $stale_while_revalidate
 	cacheOverrideTagPCI                  cacheOverrideTag = 0b0000_1000 // $pci
+	cacheOverrideTagLookupTimeout        cacheOverrideTag = 0b0001_0000 // $lookup_timeout
 )
 
 // CacheOverrideOptions collects specific, caching-related options for outbound
@@ -379,6 +461,7 @@ type CacheOverrideOptions struct {
 	TTL                  uint32 // seconds
 	StaleWhileRevalidate uint32 // seconds
 	SurrogateKey         string
+	LookupTimeout        time.Duration
 }
 
 // multiValueHostcall partially models hostcalls that provide an iterator-like
@@ -560,10 +643,16 @@ const (
 	invalidKVListHandle   = kvstoreListHandle(math.MaxUint32 - 1)
 )
 
+// KVStore represents a Fastly kv store, a collection of key/value pairs.
+// For convenience, keys and values are both modelled as Go strings.
+type KVStore struct {
+	h kvstoreHandle
+}
+
 type kvLookupConfigMask prim.U32
 
 const (
-	kvLookupConfigFlagReserved kvLookupConfigMask = 1 << 0
+	kvLookupConfigMaskReserved kvLookupConfigMask = 1 << 0
 )
 
 type kvLookupConfig struct {
@@ -573,8 +662,8 @@ type kvLookupConfig struct {
 type kvDeleteConfigMask prim.U32
 
 const (
-	kvDeleteConfigFlagReserved          kvDeleteConfigMask = 1 << 0
-	kvDeleteConfigFlagIfGenerationMatch kvDeleteConfigMask = 1 << 1
+	kvDeleteConfigMaskReserved          kvDeleteConfigMask = 1 << 0
+	kvDeleteConfigMaskIfGenerationMatch kvDeleteConfigMask = 1 << 1
 )
 
 type kvDeleteConfig struct {
@@ -588,7 +677,7 @@ type KVDeleteConfig struct {
 }
 
 func (c *KVDeleteConfig) IfGenerationMatch(generation uint64) {
-	c.mask |= kvDeleteConfigFlagIfGenerationMatch
+	c.mask |= kvDeleteConfigMaskIfGenerationMatch
 	c.opts.ifGenerationMatch = prim.U64(generation)
 }
 
@@ -606,12 +695,12 @@ type kvInsertConfigMask prim.U32
 //	       ))
 
 const (
-	kvInsertConfigFlagReserved          kvInsertConfigMask = 1 << 0
-	kvInsertConfigFlagBackgroundFetch   kvInsertConfigMask = 1 << 1
-	kvInsertConfigFlagReserved2         kvInsertConfigMask = 1 << 2
-	kvInsertConfigFlagMetadata          kvInsertConfigMask = 1 << 3
-	kvInsertConfigFlagTTLSec            kvInsertConfigMask = 1 << 4
-	kvInsertConfigFlagIfGenerationMatch kvInsertConfigMask = 1 << 5
+	kvInsertConfigMaskReserved          kvInsertConfigMask = 1 << 0
+	kvInsertConfigMaskBackgroundFetch   kvInsertConfigMask = 1 << 1
+	kvInsertConfigMaskReserved2         kvInsertConfigMask = 1 << 2
+	kvInsertConfigMaskMetadata          kvInsertConfigMask = 1 << 3
+	kvInsertConfigMaskTTLSec            kvInsertConfigMask = 1 << 4
+	kvInsertConfigMaskIfGenerationMatch kvInsertConfigMask = 1 << 5
 )
 
 // witx:
@@ -662,23 +751,23 @@ func (c *KVInsertConfig) Mode(mode KVInsertMode) {
 }
 
 func (c *KVInsertConfig) BackgroundFetch() {
-	c.mask |= kvInsertConfigFlagBackgroundFetch
+	c.mask |= kvInsertConfigMaskBackgroundFetch
 }
 
 func (c *KVInsertConfig) Metadata(meta []byte) {
-	c.mask |= kvInsertConfigFlagMetadata
+	c.mask |= kvInsertConfigMaskMetadata
 	buf := prim.NewReadBufferFromBytes(meta)
 	c.opts.metadataPtr = prim.ToPointer(buf.Char8Pointer())
 	c.opts.metadataLen = prim.U32(buf.Len())
 }
 
 func (c *KVInsertConfig) TTLSec(seconds uint32) {
-	c.mask |= kvInsertConfigFlagTTLSec
+	c.mask |= kvInsertConfigMaskTTLSec
 	c.opts.ttlSec = prim.U32(seconds)
 }
 
 func (c *KVInsertConfig) IfGenerationMatch(generation uint64) {
-	c.mask |= kvInsertConfigFlagIfGenerationMatch
+	c.mask |= kvInsertConfigMaskIfGenerationMatch
 	c.opts.ifGenerationMatch = prim.U64(generation)
 }
 
@@ -694,10 +783,10 @@ func (c *KVInsertConfig) IfGenerationMatch(generation uint64) {
 type kvListConfigMask prim.U32
 
 const (
-	kvListConfigFlagReserved kvListConfigMask = (1 << 0)
-	kvListConfigFlagCursor   kvListConfigMask = (1 << 1)
-	kvListConfigFlagLimit    kvListConfigMask = (1 << 2)
-	kvListConfigFlagPrefix   kvListConfigMask = (1 << 3)
+	kvListConfigMaskReserved kvListConfigMask = (1 << 0)
+	kvListConfigMaskCursor   kvListConfigMask = (1 << 1)
+	kvListConfigMaskLimit    kvListConfigMask = (1 << 2)
+	kvListConfigMaskPrefix   kvListConfigMask = (1 << 3)
 )
 
 // witx:
@@ -745,19 +834,19 @@ func (c *KVListConfig) Mode(mode KVListMode) {
 }
 
 func (c *KVListConfig) Cursor(cursor string) {
-	c.mask |= kvListConfigFlagCursor
+	c.mask |= kvListConfigMaskCursor
 	buf := prim.NewReadBufferFromString(cursor)
 	c.opts.cursorPtr = prim.ToPointer(buf.Char8Pointer())
 	c.opts.cursorLen = prim.U32(buf.Len())
 }
 
 func (c *KVListConfig) Limit(limit uint32) {
-	c.mask |= kvListConfigFlagLimit
+	c.mask |= kvListConfigMaskLimit
 	c.opts.limit = prim.U32(limit)
 }
 
 func (c *KVListConfig) Prefix(cursor string) {
-	c.mask |= kvListConfigFlagPrefix
+	c.mask |= kvListConfigMaskPrefix
 	buf := prim.NewReadBufferFromString(cursor)
 	c.opts.prefixPtr = prim.ToPointer(buf.Char8Pointer())
 	c.opts.prefixLen = prim.U32(buf.Len())
@@ -845,11 +934,27 @@ type (
 	secretHandle      handle
 )
 
+// SecretStore represents a Fastly secret store, a collection of
+// key/value pairs for storing sensitive data.
+type SecretStore struct {
+	h secretStoreHandle
+}
+
+// Secret represents a secret value.  Data is encrypted at rest, and is
+// only decrypted upon the first call to the secret's Plaintext method.
+type Secret struct {
+	h secretHandle
+}
+
 // witx:
 //
 //	;;; The outcome of a cache lookup (either bare or as part of a cache transaction)
 //	(typename $cache_handle (handle))
 type cacheHandle handle
+
+type CacheEntry struct {
+	h cacheHandle
+}
 
 // witx:
 //
@@ -880,6 +985,99 @@ const (
 	cacheLookupOptionsMaskRequestHeaders          cacheLookupOptionsMask = 0b0000_0010 // $request_headers
 	cacheLookupOptionsMaskAlwaysUseRequestedRange cacheLookupOptionsMask = 0b0000_1000 // $always_use_requested_range
 )
+
+type CacheLookupOptions struct {
+	opts cacheLookupOptions
+	mask cacheLookupOptionsMask
+}
+
+func (o *CacheLookupOptions) SetRequest(req *HTTPRequest) {
+	o.opts.requestHeaders = req.h
+	o.mask |= cacheLookupOptionsMaskRequestHeaders
+}
+
+func (o *CacheLookupOptions) SetAlwaysUseRequestedRange(alwaysUseRequestedRange bool) {
+	if alwaysUseRequestedRange {
+		o.mask |= cacheLookupOptionsMaskAlwaysUseRequestedRange
+	} else {
+		o.mask &= ^cacheLookupOptionsMaskAlwaysUseRequestedRange
+	}
+}
+
+type CacheGetBodyOptions struct {
+	opts cacheGetBodyOptions
+	mask cacheGetBodyOptionsMask
+}
+
+func (o *CacheGetBodyOptions) From(from uint64) {
+	o.opts.from = prim.U64(from)
+	o.mask |= cacheGetBodyOptionsMaskFrom
+}
+
+func (o *CacheGetBodyOptions) To(to uint64) {
+	o.opts.to = prim.U64(to)
+	o.mask |= cacheGetBodyOptionsMaskTo
+}
+
+type CacheWriteOptions struct {
+	opts cacheWriteOptions
+	mask cacheWriteOptionsMask
+}
+
+func (o *CacheWriteOptions) MaxAge(v time.Duration) {
+	o.opts.maxAgeNs = prim.U64(v.Nanoseconds())
+}
+
+func (o *CacheWriteOptions) SetRequest(req *HTTPRequest) {
+	o.opts.requestHeaders = req.h
+	o.mask |= cacheWriteOptionsMaskRequestHeaders
+}
+
+func (o *CacheWriteOptions) Vary(v []string) {
+	vstr := strings.Join(v, " ")
+	buf := prim.NewReadBufferFromString(vstr)
+	o.opts.varyRulePtr = prim.ToPointer(buf.Char8Pointer())
+	o.opts.varyRuleLen = buf.Len()
+	o.mask |= cacheWriteOptionsMaskVaryRule
+}
+
+func (o *CacheWriteOptions) InitialAge(v time.Duration) {
+	o.opts.initialAgeNs = prim.U64(v.Nanoseconds())
+	o.mask |= cacheWriteOptionsMaskInitialAgeNs
+}
+
+func (o *CacheWriteOptions) StaleWhileRevalidate(v time.Duration) {
+	o.opts.staleWhileRevalidateNs = prim.U64(v.Nanoseconds())
+	o.mask |= cacheWriteOptionsMaskStaleWhileRevalidateNs
+}
+
+func (o *CacheWriteOptions) SurrogateKeys(v []string) {
+	vstr := strings.Join(v, " ")
+	buf := prim.NewReadBufferFromString(vstr)
+	o.opts.surrogateKeysPtr = prim.ToPointer(buf.Char8Pointer())
+	o.opts.surrogateKeysLen = buf.Len()
+	o.mask |= cacheWriteOptionsMaskSurrogateKeys
+}
+
+func (o *CacheWriteOptions) ContentLength(v uint64) {
+	o.opts.length = prim.U64(v)
+	o.mask |= cacheWriteOptionsMaskLength
+}
+
+func (o *CacheWriteOptions) UserMetadata(v []byte) {
+	buf := prim.NewReadBufferFromBytes(v)
+	o.opts.userMetadataPtr = prim.ToPointer(buf.U8Pointer())
+	o.opts.userMetadataLen = buf.Len()
+	o.mask |= cacheWriteOptionsMaskUserMetadata
+}
+
+func (o *CacheWriteOptions) SensitiveData(v bool) {
+	if v {
+		o.mask |= cacheWriteOptionsMaskSensitiveData
+	} else {
+		o.mask &^= cacheWriteOptionsMaskSensitiveData
+	}
+}
 
 // witx:
 //
@@ -1027,6 +1225,19 @@ const (
 	purgeOptionsMaskRetBuf    purgeOptionsMask = 1 << 1 // $ret_buf
 )
 
+type PurgeOptions struct {
+	mask purgeOptionsMask
+	opts purgeOptions
+}
+
+func (o *PurgeOptions) SoftPurge(v bool) {
+	if v {
+		o.mask |= purgeOptionsMaskSoftPurge
+	} else {
+		o.mask &^= purgeOptionsMaskSoftPurge
+	}
+}
+
 // witx:
 //
 //	(typename $purge_options
@@ -1084,6 +1295,9 @@ const (
 	backendConfigOptionsMaskClientCert          backendConfigOptionsMask = 1 << 13 // $client_cert
 	backendConfigOptionsMaskGRPC                backendConfigOptionsMask = 1 << 14 // $grpc
 	backendConfigOptionsMaskKeepalive           backendConfigOptionsMask = 1 << 15 // $keepalive
+	backendConfigOptionsMaskPoolingLimits       backendConfigOptionsMask = 1 << 16 // $pooling_limits
+	backendConfigOptionsMaskPreferIPV4          backendConfigOptionsMask = 1 << 17 // $prefer_ipv4
+	backendConfigOptionsMaskHealthcheck         backendConfigOptionsMask = 1 << 18 // $healthcheck
 )
 
 // witx:
@@ -1139,6 +1353,25 @@ type backendConfigOptions struct {
 	tcpKeepaliveIntervalSecs prim.U32
 	tcpKeepaliveProbes       prim.U32
 	tcpKeepaliveTimeSecs     prim.U32
+	maxConnections           prim.U32
+	maxUse                   prim.U32
+	maxLifetimeMs            prim.U32
+	healthcheck              prim.Pointer[BackendHealthcheckConfig]
+}
+
+type BackendHealthcheckConfig struct {
+	intervalMs prim.U64
+	timeoutMs  prim.U64
+	hostPtr    prim.Pointer[prim.U8]
+	hostLen    prim.Usize
+	methodPtr  prim.Pointer[prim.U8]
+	methodLen  prim.Usize
+	pathPtr    prim.Pointer[prim.U8]
+	pathLen    prim.Usize
+	status     prim.U32
+	window     prim.U32
+	threshold  prim.U32
+	initial    prim.U32
 }
 
 // witx:
@@ -1304,6 +1537,88 @@ func (b *BackendConfigOptions) TCPKeepaliveTime(t time.Duration) {
 	b.opts.tcpKeepaliveTimeSecs = prim.U32(t.Seconds())
 }
 
+func (b *BackendConfigOptions) MaxConnections(n uint32) {
+	b.mask |= backendConfigOptionsMaskPoolingLimits
+	b.opts.maxConnections = prim.U32(n)
+}
+
+func (b *BackendConfigOptions) MaxUse(n uint32) {
+	b.mask |= backendConfigOptionsMaskPoolingLimits
+	b.opts.maxUse = prim.U32(n)
+}
+
+func (b *BackendConfigOptions) MaxLifetime(t time.Duration) {
+	b.mask |= backendConfigOptionsMaskPoolingLimits
+	b.opts.maxLifetimeMs = prim.U32(t.Milliseconds())
+}
+
+func (b *BackendConfigOptions) PreferIPV4(v bool) {
+	if v {
+		b.mask |= backendConfigOptionsMaskPreferIPV4
+	} else {
+		b.mask &^= backendConfigOptionsMaskPreferIPV4
+	}
+}
+
+func (b *BackendConfigOptions) Healthcheck(healthcheck *BackendHealthcheckConfig) {
+	b.mask |= backendConfigOptionsMaskHealthcheck
+	b.opts.healthcheck = prim.ToPointer(healthcheck)
+}
+
+func NewBackendHealthConfig(h string) *BackendHealthcheckConfig {
+	host := prim.NewReadBufferFromString(h).Wstring()
+	method := prim.NewReadBufferFromString("GET").Wstring()
+	path := prim.NewReadBufferFromString("/").Wstring()
+
+	return &BackendHealthcheckConfig{
+		intervalMs: prim.U64(15000),
+		timeoutMs:  prim.U64(5000),
+		hostPtr:    host.Data, hostLen: host.Len,
+		methodPtr: method.Data, methodLen: method.Len,
+		pathPtr: path.Data, pathLen: path.Len,
+		status:    200,
+		window:    5,
+		threshold: 3,
+		initial:   4,
+	}
+}
+
+func (h *BackendHealthcheckConfig) Interval(t time.Duration) {
+	h.intervalMs = prim.U64(t.Milliseconds())
+}
+
+func (h *BackendHealthcheckConfig) Timeout(t time.Duration) {
+	h.timeoutMs = prim.U64(t.Milliseconds())
+}
+
+func (h *BackendHealthcheckConfig) Method(m string) {
+	method := prim.NewReadBufferFromString(m).Wstring()
+	h.methodPtr = method.Data
+	h.methodLen = method.Len
+}
+
+func (h *BackendHealthcheckConfig) Path(p string) {
+	path := prim.NewReadBufferFromString(p).Wstring()
+	h.pathPtr = path.Data
+	h.pathLen = path.Len
+}
+
+func (h *BackendHealthcheckConfig) Status(status uint32) {
+	h.status = prim.U32(status)
+}
+
+func (h *BackendHealthcheckConfig) Window(w uint32) {
+	h.window = prim.U32(w)
+}
+
+func (h *BackendHealthcheckConfig) Threshold(threshold uint32) {
+	h.threshold = prim.U32(threshold)
+}
+
+func (h *BackendHealthcheckConfig) Initial(initial uint32) {
+	h.initial = prim.U32(initial)
+}
+
 // witx:
 //
 //	(typename $send_error_detail_tag
@@ -1419,11 +1734,11 @@ const (
 type sendErrorDetailMask prim.U32
 
 const (
-	sendErrorDetailMaskReserved      = 1 << 0 // $reserved
-	sendErrorDetailMaskDNSErrorRCode = 1 << 1 // $dns_error_rcode
-	sendErrorDetailMaskDNSErrorInfo  = 1 << 2 // $dns_error_info_code
-	sendErrorDetailMaskTLSAlertID    = 1 << 3 // $tls_alert_id
-	sendErrorDetailMaskH2Error       = 1 << 4 // $h2_error
+	sendErrorDetailMaskReserved      sendErrorDetailMask = 1 << 0 // $reserved
+	sendErrorDetailMaskDNSErrorRCode sendErrorDetailMask = 1 << 1 // $dns_error_rcode
+	sendErrorDetailMaskDNSErrorInfo  sendErrorDetailMask = 1 << 2 // $dns_error_info_code
+	sendErrorDetailMaskTLSAlertID    sendErrorDetailMask = 1 << 3 // $tls_alert_id
+	sendErrorDetailMaskH2Error       sendErrorDetailMask = 1 << 4 // $h2_error
 )
 
 // witx:
@@ -1712,6 +2027,7 @@ const (
 	BotCategorySearchEngineCrawler        BotCategory = 11
 	BotCategorySearchEngineSpecialization BotCategory = 12
 	BotCategorySecurityTools              BotCategory = 13
+	BotCategoryHeadless                   BotCategory = 14
 	BotCategoryUnknown                    BotCategory = -1
 )
 
@@ -1746,6 +2062,8 @@ func (c BotCategory) String() string {
 		return "SearchEngineSpecialization"
 	case BotCategorySecurityTools:
 		return "SecurityTools"
+	case BotCategoryHeadless:
+		return "Headless"
 	}
 	return "Unknown"
 }
@@ -1786,6 +2104,11 @@ var (
 //	;;; A handle to an ACL.
 //	(typename $acl_handle (handle))
 type aclHandle handle
+
+// ACL is a handle to the ACL subsystem.
+type ACLHandle struct {
+	h aclHandle
+}
 
 type ACLError prim.U32
 
@@ -1831,6 +2154,10 @@ type httpCacheHandle handle
 
 const invalidHTTPCacheHandle = httpCacheHandle(math.MaxUint32 - 1)
 
+type HTTPCacheHandle struct {
+	h httpCacheHandle
+}
+
 type httpIsCacheable prim.U32
 
 type httpIsSensitive prim.U32
@@ -1864,10 +2191,29 @@ type httpCacheLookupOptions struct {
 type httpCacheLookupOptionsMask prim.U32
 
 const (
-	httpCacheLookupOptionsFlagReserved    httpCacheLookupOptionsMask = 1 << 0
-	httpCacheLookupOptionsFlagOverrideKey httpCacheLookupOptionsMask = 1 << 1
-	httpCacheLookupOptionsFlagBackend     httpCacheLookupOptionsMask = 1 << 2
+	httpCacheLookupOptionsMaskReserved    httpCacheLookupOptionsMask = 1 << 0
+	httpCacheLookupOptionsMaskOverrideKey httpCacheLookupOptionsMask = 1 << 1
+	httpCacheLookupOptionsMaskBackend     httpCacheLookupOptionsMask = 1 << 2
 )
+
+type HTTPCacheLookupOptions struct {
+	mask httpCacheLookupOptionsMask
+	opts httpCacheLookupOptions
+}
+
+func (o *HTTPCacheLookupOptions) OverrideKey(key string) {
+	buf := prim.NewReadBufferFromString(key)
+	o.opts.overrideKeyPtr = prim.ToPointer(buf.Char8Pointer())
+	o.opts.overrideKeyLen = buf.Len()
+	o.mask |= httpCacheLookupOptionsMaskOverrideKey
+}
+
+func (o *HTTPCacheLookupOptions) Backend(backend string) {
+	buf := prim.NewReadBufferFromString(backend)
+	o.opts.backendPtr = prim.ToPointer(buf.Char8Pointer())
+	o.opts.backendLen = buf.Len()
+	o.mask |= httpCacheLookupOptionsMaskBackend
+}
 
 type (
 	httpCacheDurationNs   prim.U64
@@ -1927,17 +2273,126 @@ type httpCacheWriteOptions struct {
 	staleIfErrorNs httpCacheDurationNs
 }
 
+type HTTPCacheWriteOptions struct {
+	mask httpCacheWriteOptionsMask
+	opts httpCacheWriteOptions
+
+	vary      *prim.WriteBuffer
+	surrogate *prim.WriteBuffer
+}
+
+func (o *HTTPCacheWriteOptions) SetMaxAgeNs(maxAge uint64) {
+	o.opts.maxAgeNs = httpCacheDurationNs(maxAge)
+	// This field is required; there is no mask bit set.
+}
+
+func (o *HTTPCacheWriteOptions) MaxAgeNs() uint64 {
+	return uint64(o.opts.maxAgeNs)
+}
+
+func (o *HTTPCacheWriteOptions) SetVaryRule(rule string) {
+	b := []byte(rule)
+	o.vary = prim.NewWriteBufferFromBytes(b)
+	o.opts.varyRulePtr = prim.ToPointer(o.vary.Char8Pointer())
+	o.opts.varyRuleLen = o.vary.Len()
+	o.mask |= httpCacheWriteOptionsMaskVaryRule
+}
+
+func (o *HTTPCacheWriteOptions) VaryRule() (string, bool) {
+	if o.mask&httpCacheWriteOptionsMaskVaryRule == 0 {
+		return "", false
+	}
+
+	return o.vary.ToString(), true
+}
+
+func (o *HTTPCacheWriteOptions) SetInitialAgeNs(initialAge uint64) {
+	o.opts.initialAgeNs = httpCacheDurationNs(initialAge)
+	o.mask |= httpCacheWriteOptionsMaskInitialAge
+}
+
+func (o *HTTPCacheWriteOptions) InitialAgeNs() (uint64, bool) {
+	return uint64(o.opts.initialAgeNs), o.mask&httpCacheWriteOptionsMaskInitialAge == httpCacheWriteOptionsMaskInitialAge
+}
+
+func (o *HTTPCacheWriteOptions) SetStaleWhileRevalidateNs(staleWhileRevalidateNs uint64) {
+	o.opts.staleWhileRevalidateNs = httpCacheDurationNs(staleWhileRevalidateNs)
+	o.mask |= httpCacheWriteOptionsMaskStaleWhileRevalidate
+}
+
+func (o *HTTPCacheWriteOptions) StaleWhileRevalidateNs() (uint64, bool) {
+	return uint64(o.opts.staleWhileRevalidateNs), o.mask&httpCacheWriteOptionsMaskStaleWhileRevalidate == httpCacheWriteOptionsMaskStaleWhileRevalidate
+}
+
+func (o *HTTPCacheWriteOptions) SetSurrogateKeys(keys string) {
+	b := []byte(keys)
+	o.surrogate = prim.NewWriteBufferFromBytes(b)
+	o.opts.surrogateKeysPtr = prim.ToPointer(o.surrogate.Char8Pointer())
+	o.opts.surrogateKeysLen = o.surrogate.Len()
+	o.mask |= httpCacheWriteOptionsMaskSurrogateKeys
+}
+
+func (o *HTTPCacheWriteOptions) SurrogateKeys() (string, bool) {
+	if o.mask&httpCacheWriteOptionsMaskSurrogateKeys == 0 {
+		return "", false
+	}
+
+	return o.surrogate.ToString(), true
+}
+
+func (o *HTTPCacheWriteOptions) SetLength(length uint64) {
+	o.opts.length = httpCacheObjectLength(length)
+	o.mask |= httpCacheWriteOptionsMaskLength
+}
+
+func (o *HTTPCacheWriteOptions) Length() (uint64, bool) {
+	return uint64(o.opts.length), o.mask&httpCacheWriteOptionsMaskLength == httpCacheWriteOptionsMaskLength
+}
+
+func (o *HTTPCacheWriteOptions) SetSensitiveData(b bool) {
+	if b {
+		o.mask |= httpCacheWriteOptionsMaskSensitiveData
+	} else {
+		o.mask &^= httpCacheWriteOptionsMaskSensitiveData
+	}
+}
+
+func (o *HTTPCacheWriteOptions) SensitiveData() bool {
+	return o.mask&httpCacheWriteOptionsMaskSensitiveData == httpCacheWriteOptionsMaskSensitiveData
+}
+
+func (o *HTTPCacheWriteOptions) SetStaleIfErrorNs(staleNs uint64) {
+	o.opts.staleIfErrorNs = httpCacheDurationNs(staleNs)
+	o.mask |= httpCacheWriteOptionsMaskStaleIfError
+}
+
+func (o *HTTPCacheWriteOptions) StaleIfErrorNs() (uint64, bool) {
+	return uint64(o.opts.staleIfErrorNs), o.mask&httpCacheWriteOptionsMaskStaleIfError == httpCacheWriteOptionsMaskStaleIfError
+}
+
+func (o *HTTPCacheWriteOptions) fillConfigMask() {
+	o.mask = 0 |
+		httpCacheWriteOptionsMaskReserved |
+		httpCacheWriteOptionsMaskVaryRule |
+		httpCacheWriteOptionsMaskInitialAge |
+		httpCacheWriteOptionsMaskStaleWhileRevalidate |
+		httpCacheWriteOptionsMaskSurrogateKeys |
+		httpCacheWriteOptionsMaskLength |
+		httpCacheWriteOptionsMaskSensitiveData |
+		httpCacheWriteOptionsMaskStaleIfError
+}
+
 type httpCacheWriteOptionsMask prim.U32
 
 const (
-	httpCacheWriteOptionsFlagReserved             httpCacheWriteOptionsMask = 1 << 0
-	httpCacheWriteOptionsFlagVaryRule             httpCacheWriteOptionsMask = 1 << 1
-	httpCacheWriteOptionsFlagInitialAge           httpCacheWriteOptionsMask = 1 << 2
-	httpCacheWriteOptionsFlagStaleWhileRevalidate httpCacheWriteOptionsMask = 1 << 3
-	httpCacheWriteOptionsFlagSurrogateKeys        httpCacheWriteOptionsMask = 1 << 4
-	httpCacheWriteOptionsFlagLength               httpCacheWriteOptionsMask = 1 << 5
-	httpCacheWriteOptionsFlagSensitiveData        httpCacheWriteOptionsMask = 1 << 6
-	httpCacheWriteOptionsFlagStaleIfError         httpCacheWriteOptionsMask = 1 << 7
+	httpCacheWriteOptionsMaskReserved             httpCacheWriteOptionsMask = 1 << 0
+	httpCacheWriteOptionsMaskVaryRule             httpCacheWriteOptionsMask = 1 << 1
+	httpCacheWriteOptionsMaskInitialAge           httpCacheWriteOptionsMask = 1 << 2
+	httpCacheWriteOptionsMaskStaleWhileRevalidate httpCacheWriteOptionsMask = 1 << 3
+	httpCacheWriteOptionsMaskSurrogateKeys        httpCacheWriteOptionsMask = 1 << 4
+	httpCacheWriteOptionsMaskLength               httpCacheWriteOptionsMask = 1 << 5
+	httpCacheWriteOptionsMaskSensitiveData        httpCacheWriteOptionsMask = 1 << 6
+	httpCacheWriteOptionsMaskStaleIfError         httpCacheWriteOptionsMask = 1 << 7
 )
 
 // shielding.witx
@@ -1945,8 +2400,10 @@ const (
 type shieldingBackendOptionsMask prim.U32
 
 const (
-	shieldingBackendOptionsFlagReserved    shieldingBackendOptionsMask = 1 << 0
-	shieldingBackendOptionsFlagUseCacheKey shieldingBackendOptionsMask = 1 << 1
+	shieldingBackendOptionsMaskReserved            shieldingBackendOptionsMask = 1 << 0
+	shieldingBackendOptionsMaskUseCacheKey         shieldingBackendOptionsMask = 1 << 1
+	shieldingBackendOptionsMaskFirstByteTimeout    shieldingBackendOptionsMask = 1 << 2
+	shieldingBackendOptionsMaskBetweenBytesTimeout shieldingBackendOptionsMask = 1 << 3
 )
 
 type shieldingBackendOptions struct {
@@ -1958,8 +2415,10 @@ type shieldingBackendOptions struct {
 	//
 	// If this field is not set, no surrogate keys will be associated with the response. This
 	// means that the response cannot be purged except via a purge-all operation.
-	cacheKeyPtr prim.Pointer[prim.Char8]
-	cacheKeyLen prim.Usize
+	cacheKeyPtr           prim.Pointer[prim.Char8]
+	cacheKeyLen           prim.Usize
+	firstByteTimeoutMs    prim.U32
+	betweenBytesTimeoutMs prim.U32
 }
 
 type ShieldingBackendOptions struct {
@@ -1968,10 +2427,20 @@ type ShieldingBackendOptions struct {
 }
 
 func (s *ShieldingBackendOptions) CacheKey(key string) {
-	s.mask |= shieldingBackendOptionsFlagUseCacheKey
+	s.mask |= shieldingBackendOptionsMaskUseCacheKey
 	buf := prim.NewReadBufferFromString(key)
 	s.opts.cacheKeyPtr = prim.ToPointer(buf.Char8Pointer())
 	s.opts.cacheKeyLen = buf.Len()
+}
+
+func (s *ShieldingBackendOptions) FirstByteTimeout(t time.Duration) {
+	s.mask |= shieldingBackendOptionsMaskFirstByteTimeout
+	s.opts.firstByteTimeoutMs = prim.U32(t.Milliseconds())
+}
+
+func (s *ShieldingBackendOptions) BetweenBytesTimeout(t time.Duration) {
+	s.mask |= shieldingBackendOptionsMaskBetweenBytesTimeout
+	s.opts.betweenBytesTimeoutMs = prim.U32(t.Milliseconds())
 }
 
 type ShieldInfo struct {
@@ -2032,21 +2501,21 @@ type InspectInfo struct {
 }
 
 func (o *InspectInfo) Corp(v string) {
-	o.mask |= inspectInfoFlagCorp
+	o.mask |= inspectInfoMaskCorp
 	buf := prim.NewReadBufferFromString(v)
 	o.opts.corpPtr = prim.ToPointer(buf.Char8Pointer())
 	o.opts.corpLen = prim.U32(buf.Len())
 }
 
 func (o *InspectInfo) Workspace(v string) {
-	o.mask |= inspectInfoFlagWorkspace
+	o.mask |= inspectInfoMaskWorkspace
 	buf := prim.NewReadBufferFromString(v)
 	o.opts.workspacePtr = prim.ToPointer(buf.Char8Pointer())
 	o.opts.workspaceLen = prim.U32(buf.Len())
 }
 
 func (o *InspectInfo) OverrideClientIP(v string) {
-	o.mask |= inspectInfoFlagOverrideClientIP
+	o.mask |= inspectInfoMaskOverrideClientIP
 	buf := prim.NewReadBufferFromString(v)
 	o.opts.overrideClientIPPtr = prim.ToPointer(buf.Char8Pointer())
 	o.opts.overrideClientIPLen = prim.U32(buf.Len())
@@ -2066,10 +2535,10 @@ func (o *InspectInfo) OverrideClientIP(v string) {
 type inspectInfoMask uint32
 
 const (
-	inspectInfoFlagReserved         inspectInfoMask = 1 << 0
-	inspectInfoFlagCorp             inspectInfoMask = 1 << 1
-	inspectInfoFlagWorkspace        inspectInfoMask = 1 << 2
-	inspectInfoFlagOverrideClientIP inspectInfoMask = 1 << 3
+	inspectInfoMaskReserved         inspectInfoMask = 1 << 0
+	inspectInfoMaskCorp             inspectInfoMask = 1 << 1
+	inspectInfoMaskWorkspace        inspectInfoMask = 1 << 2
+	inspectInfoMaskOverrideClientIP inspectInfoMask = 1 << 3
 )
 
 // witx:

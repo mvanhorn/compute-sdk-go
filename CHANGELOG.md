@@ -1,4 +1,48 @@
-## Unreleased
+## 1.11.0 (2026-10-06)
+
+- fsthttp: fix BeforeSend receiving the original request's headers instead of the suggested backend request's (#305)
+- fsthttp: fall back to stale-if-error response when BeforeSend hook or suggested backend request fails
+- fsthttp: support timeouts for http cache lookups
+- examples: add grpc-proxy example
+
+## 1.10.0 (2026-09-03)
+
+- fsthttp: add ComplianceRegion and RawHeaders to FastlyMeta
+- fsthttp: fix reusing body and response handles with StatusEarlyHints
+- internal: clean up abi type definitions
+- fsthttp: export SendErrorDetailTag
+- integration_tests: remove extra http requests from tests
+- shielding: add first byte and between bytes timeouts
+- fsthttp: add support for dynamic backend healthchecks
+- Makefile,tools.mod: tooling upgrades, fixes
+- fsthttp: allow removing support for net/http
+- internal: reduce memory usage by removing []byte -> string -> []byte conversions
+
+## 1.9.0 (2026-08-07)
+
+- fsthttp: add Headless bot type
+- fsthttp: make fsthttp.Transport (net/http adapter) goroutine-safe
+- fsthttp: improve error messages when fanout is not enabled
+- all: improve error handling in examples and tests
+
+## 1.8.1 (2026-06-24)
+
+- fsthttp: ensure stale-if-error options are passed to ABI hostcall (#265)
+
+## 1.8.0 (2026-06-23)
+
+- kvstore: allow streaming bodies on insert (#240)
+- fsthttp: fix broken api for DownstreamTLSCientCertVerifyResult (#241)
+- fsthttp: add bot detection hostcalls (#242)
+- fsthttp: add ResVPNProxy support (#243, #247)
+- fsthttp: Add stale-if-error logic to http caching layer (#236)
+- kvstore: add IfGenerationMatch to InsertConfig (#246)
+- kvstore: restore missing error check for io.Copy() (#251)
+- fsthttp: prevent integer underflow for maxAge (#249)
+- imageopto: fix url spelling for contrast parameter (#260)
+- imageopto: reduce fmt usage (#259)
+- fsthttp: add MaxAge and TTLRemaining to CandidateResponse (#262)
+- other small fixes for unit tests, parameter validation, and spelling
 
 ## 1.7.0 (2026-03-05)
 

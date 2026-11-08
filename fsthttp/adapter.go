@@ -1,3 +1,5 @@
+//go:build !fsthttp_no_net_http
+
 package fsthttp
 
 import (

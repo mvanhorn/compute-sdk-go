@@ -26,16 +26,22 @@ jobs:
         run: go mod download -modfile=tools.mod
 
       - name: vet
-        run: go vet ./...
+        run: GOOS=wasip1 GOARCH=wasm go vet -tags=fastlyinternaldebug ./...
 
       - name: staticcheck
-        run: go tool -modfile=tools.mod staticcheck ./...
+        run: |
+          go install -modfile=tools.mod honnef.co/go/tools/cmd/staticcheck
+          GOOS=wasip1 GOARCH=wasm staticcheck -tags=fastlyinternaldebug ./...
 
       - name: nilness
-        run: go tool -modfile=tools.mod nilness ./...
+        run: |
+          go install -modfile=tools.mod golang.org/x/tools/go/analysis/passes/nilness/cmd/nilness
+          GOOS=wasip1 GOARCH=wasm go vet -tags fastlyinternaldebug -vettool $(which nilness) ./...
 
       - name: ineffassign
-        run: go tool -modfile=tools.mod ineffassign ./...
+        run: |
+          go install -modfile=tools.mod github.com/gordonklaus/ineffassign
+          GOOS=wasip1 GOARCH=wasm ineffassign ./...
 
   test:
     runs-on: ubuntu-latest
@@ -60,8 +66,8 @@ jobs:
 
       - name: Symlink Viceroy to expected location
         run: |
+          ln -sv "$(which viceroy)" "${XDG_CONFIG_HOME:-$HOME/.config}/fastly/viceroy"
           fastly version
-          ln -s "$(which viceroy)" "${XDG_CONFIG_HOME:-$HOME/.config}/fastly/viceroy"
 
       - name: Tests - Go
         run: make test-go

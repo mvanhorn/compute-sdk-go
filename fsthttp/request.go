@@ -156,6 +156,25 @@ func NewRequest(method string, uri string, body io.Reader) (*Request, error) {
 // _parseRequestURI can be set by SetParseRequestURI
 var _parseRequestURI func(string) (*url.URL, error) = url.ParseRequestURI
 
+func headersFromHandle(abiReq *fastly.HTTPRequest) (Header, error) {
+	header := NewHeader()
+	keys := abiReq.GetHeaderNames()
+	for keys.Next() {
+		k := string(keys.Bytes())
+		vals := abiReq.GetHeaderValues(k)
+		for vals.Next() {
+			header.Add(k, string(vals.Bytes()))
+		}
+		if err := vals.Err(); err != nil {
+			return nil, fmt.Errorf("read header key %q: %w", k, err)
+		}
+	}
+	if err := keys.Err(); err != nil {
+		return nil, fmt.Errorf("read header keys: %w", err)
+	}
+	return header, nil
+}
+
 func newClientRequest(abiReq *fastly.HTTPRequest, abiReqBody *fastly.HTTPBody) (*Request, error) {
 	method, err := abiReq.GetMethod()
 	if err != nil {
@@ -177,21 +196,9 @@ func newClientRequest(abiReq *fastly.HTTPRequest, abiReqBody *fastly.HTTPBody) (
 		return nil, fmt.Errorf("get protocol version: %w", err)
 	}
 
-	header := NewHeader()
-	keys := abiReq.GetHeaderNames()
-	for keys.Next() {
-		k := string(keys.Bytes())
-		vals := abiReq.GetHeaderValues(k)
-		for vals.Next() {
-			v := string(vals.Bytes())
-			header.Add(k, v)
-		}
-		if err := vals.Err(); err != nil {
-			return nil, fmt.Errorf("read header key %q: %w", k, err)
-		}
-	}
-	if err := keys.Err(); err != nil {
-		return nil, fmt.Errorf("read header keys: %w", err)
+	header, err := headersFromHandle(abiReq)
+	if err != nil {
+		return nil, err
 	}
 
 	remoteAddr, err := abiReq.DownstreamClientIPAddr()
@@ -404,6 +411,11 @@ func (req *Request) FastlyMeta() (*FastlyMeta, error) {
 			return nil, fmt.Errorf("get OH fingerprint: %w", err)
 		}
 
+		fastlyMeta.ComplianceRegion, err = req.downstream.req.DownstreamComplianceRegion()
+		if err != nil {
+			return nil, fmt.Errorf("get compliance region: %w", err)
+		}
+
 		fastlyMeta.DDOSDetected, err = req.downstream.req.DownstreamDDOSDetected()
 		if err != nil {
 			return nil, fmt.Errorf("get ddos detected: %w", err)
@@ -413,6 +425,23 @@ func (req *Request) FastlyMeta() (*FastlyMeta, error) {
 		if err != nil {
 			return nil, fmt.Errorf("get fastly key is valid: %w", err)
 		}
+
+		headerCount, err := req.downstream.req.DownstreamOriginalHeaderCount()
+		if err != nil {
+			return nil, fmt.Errorf("get original headers: %w", err)
+		}
+		if headerCount != 0 {
+			headers := make([]string, 0, headerCount)
+			vals := req.downstream.req.DownstreamOriginalHeaderNames()
+			for vals.Next() {
+				headers = append(headers, string(vals.Bytes()))
+			}
+			if err := vals.Err(); err != nil {
+				return nil, fmt.Errorf("read original headers: %w", err)
+			}
+			fastlyMeta.RawHeaders = headers
+		}
+
 	}
 
 	req.fastlyMeta = fastlyMeta
@@ -594,6 +623,24 @@ func (req *Request) sendToImageOpto(ctx context.Context, backend string) (*Respo
 
 var guestCacheSWRPending sync.WaitGroup
 
+// serveStaleOnError substitutes the transaction's stale-if-error response, masking origErr on
+// it, when state indicates one is available. Otherwise it returns origErr unchanged.
+func serveStaleOnError(cacheHandle *fastly.HTTPCacheHandle, req *Request, backend string, state fastly.CacheLookupState, origErr error) (*Response, error) {
+	if !state.Has(fastly.CacheLookupStateUsableIfError) {
+		return nil, origErr
+	}
+
+	// Substitute stale-if-error response; let anyone else in the collapse know as well.
+	fastly.HTTPCacheTransactionChooseStale(cacheHandle)
+	resp, err := httpCacheGetFoundResponse(cacheHandle, req, backend, true, false)
+	if err != nil {
+		return nil, err
+	}
+	resp.maskedError = origErr
+	resp.updateFastlyCacheHeaders(req)
+	return resp, nil
+}
+
 func (req *Request) sendWithGuestCache(ctx context.Context, backend string) (*Response, error) {
 	// use guest cache
 
@@ -637,7 +684,7 @@ func (req *Request) sendWithGuestCache(ctx context.Context, backend string) (*Re
 			fastly.HTTPCacheTransactionClose(cacheHandle)
 		}
 	}()
-	state, err := httpCacheWait(cacheHandle)
+	state, err := httpCacheWait(ctx, cacheHandle, req.CacheOptions.LookupTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -693,25 +740,12 @@ func (req *Request) sendWithGuestCache(ctx context.Context, backend string) (*Re
 	if state.Has(fastly.CacheLookupStateMustInsertOrUpdate) {
 		pending, err := req.sendAsyncForCaching(ctx, cacheHandle, backend)
 		if err != nil {
-			return nil, err
+			return serveStaleOnError(cacheHandle, req, backend, state, err)
 		}
 
 		candidateResp, err := newCandidateFromPendingBackendCaching(pending)
 		if err != nil {
-			if state.Has(fastly.CacheLookupStateUsableIfError) {
-				// Substitute stale-if-error response; let anyone else in the collapse know as
-				// well.
-				fastly.HTTPCacheTransactionChooseStale(cacheHandle)
-				resp, foundErr := httpCacheGetFoundResponse(cacheHandle, req, backend, true, false)
-				if foundErr != nil {
-					return nil, foundErr
-				}
-				resp.maskedError = err
-				resp.updateFastlyCacheHeaders(req)
-				return resp, nil
-			}
-
-			return nil, err
+			return serveStaleOnError(cacheHandle, req, backend, state, err)
 		}
 
 		resp, err := candidateResp.applyAndStreamBack(req)
@@ -740,7 +774,7 @@ func (req *Request) sendWithGuestCache(ctx context.Context, backend string) (*Re
 	return resp, nil
 }
 
-func newRequestFromHandle(reqh *fastly.HTTPRequest, body io.ReadCloser, headers Header, options CacheOptions) (*Request, error) {
+func newRequestFromHandle(reqh *fastly.HTTPRequest, body io.ReadCloser, options CacheOptions) (*Request, error) {
 	method, err := reqh.GetMethod()
 	if err != nil {
 		return nil, err
@@ -752,9 +786,14 @@ func newRequestFromHandle(reqh *fastly.HTTPRequest, body io.ReadCloser, headers 
 
 	req, _ := NewRequest(method, url, body)
 	req.CacheOptions = options
-	req.Header = headers
 	req.abi.req = reqh
 	req.abi.body, _ = abiBodyFrom(body)
+
+	header, err := headersFromHandle(reqh)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = header
 
 	return req, nil
 }
@@ -773,15 +812,29 @@ func (req *Request) sendAsyncForCaching(ctx context.Context, cacheHandle *fastly
 		return nil, fmt.Errorf("get suggested backend request: %w", err)
 	}
 
-	suggReq, err := newRequestFromHandle(reqh, req.Body, req.Header, req.CacheOptions)
+	suggReq, err := newRequestFromHandle(reqh, req.Body, req.CacheOptions)
 	if err != nil {
 		return nil, err
 	}
 
 	if suggReq.CacheOptions.BeforeSend != nil {
+		beforeKeys := suggReq.Header.Keys()
+
 		if err := suggReq.CacheOptions.BeforeSend(suggReq); err != nil {
 			// TODO(dgryski): sentinel ErrReject ?
 			return nil, err
+		}
+
+		// setABIRequestOptions (below) can only add/overwrite headers on the
+		// suggested request's handle; it can't express a deletion. If BeforeSend
+		// removed a header the host had added (e.g. If-None-Match for
+		// revalidation), remove it from the handle too.
+		for _, k := range beforeKeys {
+			if len(suggReq.Header.Values(k)) == 0 {
+				if err := suggReq.abi.req.RemoveHeader(k); err != nil {
+					return nil, fmt.Errorf("remove header %q: %w", k, err)
+				}
+			}
 		}
 	}
 
@@ -955,6 +1008,7 @@ func (req *Request) setABIRequestOptions() error {
 		TTL:                  req.CacheOptions.TTL,
 		StaleWhileRevalidate: req.CacheOptions.StaleWhileRevalidate,
 		SurrogateKey:         req.CacheOptions.SurrogateKey,
+		LookupTimeout:        req.CacheOptions.LookupTimeout,
 	}
 
 	if err := abiReq.SetCacheOverride(cacheOpts); err != nil {
@@ -1036,6 +1090,10 @@ type CacheOptions struct {
 	// Cache key to use in lieu of the automatically-generated cache key based on the request's
 	// properties.
 	OverrideKey string
+
+	// LookupTimeout bounds how long this request will wait for a cache
+	// lookup to resolve.
+	LookupTimeout time.Duration
 
 	// Sets a callback to be invoked if a request is going all the way to a
 	// backend, allowing the request to be modified beforehand.
@@ -1171,6 +1229,9 @@ type FastlyMeta struct {
 	// OH is a fingerprint of the client request's original headers
 	OH []byte
 
+	// Compliance region is the compliance region in which this request is being processed.
+	ComplianceRegion string
+
 	// DDOSDetected is true if the request was determined to be part of a DDOS attack.
 	DDOSDetected bool
 
@@ -1182,6 +1243,12 @@ type FastlyMeta struct {
 	// For example, if this is were 3, it means that this is the 3rd request handled by the sandbox.
 	// This will be zero if this is not a client request.
 	SandboxRequests int
+
+	// RawHeaders is the client request's header names exactly as they were originally received.
+	//
+	// This includes both the original header name characters' cases, as well as the original order of
+	// the received headers.
+	RawHeaders []string
 }
 
 // DecompressResponseOptions control the auto decompress response behaviour.
@@ -1197,6 +1264,8 @@ type DecompressResponseOptions struct {
 
 var ErrHandoffNotSupported = errors.New("handoff not supported on this request")
 
+var ErrFanoutNotEnabled = errors.New("fanout or websockets are not enabled on this service; please contact support for help")
+
 // HandoffWebsocket passes the WebSocket directly to a backend.
 //
 // This can only be used on services that have the WebSockets feature
@@ -1209,7 +1278,13 @@ func (r *Request) HandoffWebsocket(backend string) error {
 	if r.downstream.req == nil {
 		return ErrHandoffNotSupported
 	}
-	return r.downstream.req.HandoffWebsocket(backend)
+	err := r.downstream.req.HandoffWebsocket(backend)
+	if err != nil {
+		if status, ok := fastly.IsFastlyError(err); ok && status == fastly.FastlyStatusUnsupported {
+			return ErrFanoutNotEnabled
+		}
+	}
+	return err
 }
 
 // HandoffFanout passes the request through the Fanout GRIP proxy and on to
@@ -1224,7 +1299,13 @@ func (r *Request) HandoffFanout(backend string) error {
 	if r.downstream.req == nil {
 		return ErrHandoffNotSupported
 	}
-	return r.downstream.req.HandoffFanout(backend)
+	err := r.downstream.req.HandoffFanout(backend)
+	if err != nil {
+		if status, ok := fastly.IsFastlyError(err); ok && status == fastly.FastlyStatusUnsupported {
+			return ErrFanoutNotEnabled
+		}
+	}
+	return err
 }
 
 type InspectOptions struct {

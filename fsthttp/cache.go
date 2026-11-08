@@ -1,12 +1,18 @@
 package fsthttp
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"time"
 
 	"github.com/fastly/compute-sdk-go/internal/abi/fastly"
 )
+
+// cacheLookupSelectTimeout bounds how long each wait for the cache lookup
+// to become ready blocks before re-checking the overall LookupTimeout
+// deadline and context cancellation.
+const cacheLookupSelectTimeout = 100 * time.Millisecond
 
 // CandidateResponse is a response from a backend that is a candidate for caching.
 type CandidateResponse struct {
@@ -159,7 +165,36 @@ const (
 	cacheStorageActionInvalid = 0xffff
 )
 
-func httpCacheWait(c *fastly.HTTPCacheHandle) (fastly.CacheLookupState, error) {
+func httpCacheWait(ctx context.Context, c *fastly.HTTPCacheHandle, timeout time.Duration) (fastly.CacheLookupState, error) {
+	if timeout > 0 {
+		deadline := time.Now().Add(timeout)
+
+		for {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return 0, fastly.FastlyError{
+					Status: fastly.FastlyStatusError,
+					Detail: SendError{Tag: SendErrorHTTPResponseTimeout},
+				}
+			}
+
+			intervalMs := min(remaining, cacheLookupSelectTimeout).Milliseconds()
+			ready, err := fastly.HTTPCacheAwaitReady(c, uint32(max(1, intervalMs))) // don't pass 0, that blocks until ready.
+			if err != nil {
+				return 0, fmt.Errorf("await cache lookup: %w", err)
+			}
+			if ready {
+				break
+			}
+
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			default:
+			}
+		}
+	}
+
 	state, err := fastly.HTTPCacheGetState(c)
 	if err != nil {
 		return 0, fmt.Errorf("get state: %w", err)
@@ -486,9 +521,10 @@ func (candidateResponse *CandidateResponse) StaleIfError() (uint32, error) {
 // if the Backend's response is a 5xx error.
 //
 // This method returns true if there is a cached response that is within the stale-if-error
-// period. If a stale-if-error response is available, and the AfterSend hook returns an
-// error, the response from the Backend will not be cached, and the [Request.Send] call will
-// return the stale-if-error response.
+// period. If a stale-if-error response is available, and obtaining a response from the Backend
+// fails -- because the BeforeSend or AfterSend hook returns an error, or because the request to
+// the Backend itself fails -- the [Request.Send] call will return the stale-if-error response
+// instead of the error.
 func (candidateResponse *CandidateResponse) StaleIfErrorAvailable() bool {
 	state, _ := fastly.HTTPCacheGetState(candidateResponse.cacheHandle)
 	return state.Has(fastly.CacheLookupStateUsableIfError)
@@ -630,10 +666,7 @@ func (candidateResponse *CandidateResponse) buildFreshSuggestedCacheWriteOptions
 }
 
 func httpCacheGetSuggestedCacheWriteOptions(cacheHandle *fastly.HTTPCacheHandle, resp *fastly.HTTPResponse) (*cacheWriteOptions, error) {
-	var opts cacheWriteOptions
-	opts.abiOpts.FillConfigMask()
-
-	newABIOpts, err := fastly.HTTPCacheGetSuggestedCacheOptions(cacheHandle, resp, &opts.abiOpts)
+	newABIOpts, err := fastly.HTTPCacheGetSuggestedCacheOptions(cacheHandle, resp)
 	if err != nil {
 		return nil, fmt.Errorf("get suggested cache options: %w", err)
 	}
@@ -673,6 +706,12 @@ func (candidateResponse *CandidateResponse) finalizeOptions() (fastly.HTTPCacheS
 		opts.staleWhileRevalidate = candidateResponse.overrideStaleWhileRevalidate
 	} else {
 		opts.staleWhileRevalidate = suggestedCacheWriteOptions.staleWhileRevalidate
+	}
+
+	if candidateResponse.useSIE {
+		opts.staleIfError = candidateResponse.overrideStaleIfError
+	} else {
+		opts.staleIfError = suggestedCacheWriteOptions.staleIfError
 	}
 
 	if candidateResponse.useVary {

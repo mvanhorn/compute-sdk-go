@@ -99,8 +99,7 @@ func (resp *Response) Trailers() (Header, error) {
 		k := string(keys.Bytes())
 		vals := abiBody.GetTrailerValues(k)
 		for vals.Next() {
-			v := string(vals.Bytes())
-			trailers.Add(k, v)
+			trailers.Add(k, string(vals.Bytes()))
 		}
 		if err := vals.Err(); err != nil {
 			return nil, fmt.Errorf("read trailer key %q: %w", k, err)
@@ -150,8 +149,7 @@ func newResponse(req *Request, backend string, abiResp *fastly.HTTPResponse, abi
 		k := string(keys.Bytes())
 		vals := abiResp.GetHeaderValues(k)
 		for vals.Next() {
-			v := string(vals.Bytes())
-			header.Add(k, v)
+			header.Add(k, string(vals.Bytes()))
 		}
 		if err := vals.Err(); err != nil {
 			return nil, fmt.Errorf("read header key %q: %w", k, err)
@@ -414,6 +412,22 @@ func (resp *responseWriter) WriteHeader(code int) {
 	resp.trailers = parseTrailers(resp.header.Values("Trailer"))
 
 	if code == StatusEarlyHints {
+		if resp.sendErr == nil {
+			// abiBody and abiResp are single-use only.  We used them above in SendDownstream().
+			// If resp.sendErr is nil we might need to use them again -- reset them.
+			var err error
+			resp.abiResp, err = fastly.NewHTTPResponse()
+			if err != nil {
+				resp.sendErr = fmt.Errorf("create response: %w", err)
+				return
+			}
+			resp.abiBody, err = fastly.NewHTTPBody()
+			if err != nil {
+				resp.sendErr = fmt.Errorf("create response body: %w", err)
+				return
+			}
+		}
+
 		// For early hints, don't mark the headers as "sent" so we can send them again next time.
 		return
 	}
